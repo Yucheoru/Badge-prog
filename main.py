@@ -21,6 +21,20 @@ BADGE_FILLS = {
 }
 
 
+def _norm(s: str) -> str:
+    """スペース・全角スペースを正規化して比較用文字列を返す"""
+    import re
+    s = re.sub(r'[\s　]+', ' ', str(s)).strip()
+    s = re.sub(r'\s+（', '（', s)   # （の直前のスペースを除去
+    s = re.sub(r'）\s+', '）', s)   # ）の直後のスペースを除去
+    return s
+
+
+def _norm_sid(s: str) -> str:
+    """学生番号を正規化（大文字小文字を統一）"""
+    return _norm(s).upper()
+
+
 def _find_col(df: pd.DataFrame, *keywords: str) -> str | None:
     kws = [k.lower() for k in keywords]
     for col in df.columns:
@@ -57,23 +71,37 @@ def process(input_path: str, output_path: str, log=print) -> None:
     total_input = len(df)
     log(f'入力データ合計: {total_input} 行')
 
-    # ---- オープンバッジ登録日の取得（OpenBadge_all_cleanシート） ----
-    reg_lookup: dict = {}
+    # ---- OpenBadge_all_clean から登録日・メールを取得 ----
+    # キー: (氏名, プログラム名)  登録日はタイムスタンプの最古値
+    reg_lookup:   dict = {}   # (学生番号, prog) -> オープンバッジ登録日
+    email_lookup: dict = {}   # (学生番号, prog) -> email
+
     reg_sheet = 'OpenBadge_all_clean'
     if reg_sheet in xl.sheet_names:
-        df_reg = xl.parse(reg_sheet, header=0)
-        r_sid    = _find_col(df_reg, '学生番号') or _find_col(df_reg, '学籍番号')
-        r_status = _find_col(df_reg, 'badge_status') or _find_col(df_reg, 'badge', 'status') or _find_col(df_reg, 'プログラム')
-        r_date   = _find_col(df_reg, '登録日') or _find_col(df_reg, 'registration')
-        if r_sid and r_status and r_date:
+        df_reg  = xl.parse(reg_sheet, header=0)
+        r_sid   = _find_col(df_reg, '学生番号') or _find_col(df_reg, 'student')
+        r_prog  = _find_col(df_reg, 'プログラム')
+        r_date  = _find_col(df_reg, 'オープンバッジ登録日') or _find_col(df_reg, '登録日')
+        r_email = _find_col(df_reg, 'email') or _find_col(df_reg, 'メール')
+
+        if r_sid and r_prog and r_date:
+            df_reg[r_date] = pd.to_datetime(df_reg[r_date], errors='coerce')
             for _, row in df_reg.iterrows():
-                key = (str(row[r_sid]).strip(), str(row[r_status]).strip())
-                reg_lookup[key] = row[r_date]
-            log(f'OpenBadge_all_clean: {len(reg_lookup)} 件の登録日を取得')
+                sid  = _norm_sid(row[r_sid])
+                prog = _norm(row[r_prog])
+                date = row[r_date]
+                key  = (sid, prog)
+                # 最古の登録日を使用
+                if pd.notna(date) and (key not in reg_lookup or date < reg_lookup[key]):
+                    reg_lookup[key] = date
+                # メールアドレス
+                if r_email and pd.notna(row.get(r_email)) and key not in email_lookup:
+                    email_lookup[key] = row[r_email]
+            log(f'OpenBadge_all_clean: {len(reg_lookup)} 件の登録日を取得（学生番号＋プログラム名で照合）')
         else:
             log(f'警告: OpenBadge_all_cleanシートのカラムを特定できませんでした（列: {list(df_reg.columns)}）')
     else:
-        log(f'警告: {reg_sheet} シートが見つかりません。登録日は空欄になります。')
+        log(f'警告: {reg_sheet} シートが見つかりません。登録日・メールは空欄になります。')
         log(f'  利用可能シート: {xl.sheet_names}')
 
     # ---- カラム検出 ----
@@ -124,8 +152,8 @@ def process(input_path: str, output_path: str, log=print) -> None:
     # ---- 学生×プログラム名ごとに集計 ----
     records: dict = {}
     for _, row in df_valid.iterrows():
-        sid  = str(row[col_sid]).strip()
-        prog = str(row[col_status]).strip()
+        sid  = _norm_sid(row[col_sid])
+        prog = _norm(row[col_status])
         key  = (sid, prog)                   # ← (学生番号, プログラム名) で一意に管理
         if key not in records:
             records[key] = {
@@ -142,27 +170,40 @@ def process(input_path: str, output_path: str, log=print) -> None:
     total_before_dedup = 0
     total_after_dedup  = 0
 
+    before_reg_removed = 0
+
     for (sid, jcpp), data in records.items():
-        name         = data['name_counter'].most_common(1)[0][0]
-        before_dedup = len(data['dates_valid'])
-        sorted_dates = sorted(data['dates_valid'])   # 重複込みでカウント
+        name = data['name_counter'].most_common(1)[0][0]
+
+        # 登録日・メールを取得（学生番号＋プログラム名で照合）
+        reg_date = reg_lookup.get((sid, jcpp), None)
+        email    = email_lookup.get((sid, jcpp), '')
+
+        # 登録日より前の参加日を除外
+        all_dates = sorted(data['dates_valid'])
+        if reg_date and pd.notna(reg_date):
+            filtered_dates = [d for d in all_dates if d >= reg_date]
+            before_reg_removed += len(all_dates) - len(filtered_dates)
+        else:
+            filtered_dates = all_dates
+
+        before_dedup = len(filtered_dates)
+        sorted_dates = filtered_dates
         after_dedup  = len(sorted_dates)
         total_before_dedup += before_dedup
         total_after_dedup  += after_dedup
         badge = determine_badge(after_dedup, jcpp)
 
-        # 登録日をオープンバッジ登録_2026から取得（学生番号＋バッジ種類で照合）
-        reg_date = reg_lookup.get((sid, jcpp), '')
-
         row_data: dict = {
-            'No':               '',   # ソート後に採番
-            'プログラム名':     jcpp,
-            '学生番号':         sid,
-            '氏名':             name,
-            '国籍':             '',
-            'オープンバッジ登録日': reg_date,
-            '取得badge':        badge,
-            '活動日':           after_dedup,
+            'No':                   '',
+            'プログラム名':         jcpp,
+            '学生番号':             sid,
+            '氏名':                 name,
+            '国籍':                 '',
+            'メールアドレス':       email,
+            'オープンバッジ登録日': reg_date if (reg_date is not None and pd.notna(reg_date)) else '',
+            '取得badge':            badge,
+            '活動日':               after_dedup,
         }
         for j, d in enumerate(sorted_dates, start=1):
             row_data[f'参加日{j}'] = d.strftime('%Y-%m-%d')
@@ -176,10 +217,10 @@ def process(input_path: str, output_path: str, log=print) -> None:
     log(f'  除外（結果統合≠1）   : {len(df_excluded)}')
     log(f'  有効行（結果統合=1）  : {len(df_valid)}')
     log(f'  うちNaN日付で除外     : {nan_date_count}')
-    log(f'  重複日付で除外        : {dedup_removed}')
-    log(f'  活動日合計            : {total_after_dedup}')
+    log(f'  登録日より前で除外    : {before_reg_removed}')
     log(f'  重複日付で除去（同日複数回）: {dedup_removed}')
-    log(f'  検算（除外+重複+活動日）  : {len(df_excluded) + dedup_removed + total_after_dedup} {"✓" if len(df_excluded)+dedup_removed+total_after_dedup==total_input else "← 不一致！"}')
+    log(f'  活動日合計            : {total_after_dedup}')
+    log(f'  検算（除外+登録前+重複+活動日）: {len(df_excluded) + before_reg_removed + dedup_removed + total_after_dedup} {"✓" if len(df_excluded)+before_reg_removed+dedup_removed+total_after_dedup==total_input else "← 不一致！"}')
     log('─' * 40)
 
     # ---- プログラム名順にソートしてNo採番 ----
