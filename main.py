@@ -20,6 +20,9 @@ BADGE_FILLS = {
     'Bronze': PatternFill(fill_type='solid', fgColor='CD7F32'),
 }
 
+# 0.5時間（半分参加）の参加日セルを薄いskyblueで塗る
+HALF_FILL = PatternFill(fill_type='solid', fgColor='CCE5FF')
+
 
 def _norm(s: str) -> str:
     """スペース・全角スペースを正規化して比較用文字列を返す"""
@@ -44,7 +47,7 @@ def _find_col(df: pd.DataFrame, *keywords: str) -> str | None:
     return None
 
 
-def determine_badge(count: int, jcpp_type: str) -> str:
+def determine_badge(count: float, jcpp_type: str) -> str:
     jcpp_lower = str(jcpp_type).lower()
     criteria = DEFAULT_CRITERIA
     for keywords, crit in BADGE_CRITERIA_RULES:
@@ -123,12 +126,13 @@ def process(input_path: str, output_path: str, log=print) -> None:
     filter_dist = df[col_filter].value_counts(dropna=False)
     log(f'結果統合列の値の分布: {filter_dist.to_dict()}')
 
-    # ---- フィルター（結果統合=1 のみ） ----
-    mask_valid  = df[col_filter] == 1
+    # ---- フィルター（結果統合 > 0、すなわち 0.5 と 1 を有効化） ----
+    df[col_filter] = pd.to_numeric(df[col_filter], errors='coerce')
+    mask_valid  = df[col_filter] > 0
     df_excluded = df[~mask_valid].copy()
     df_valid    = df[mask_valid].copy()
 
-    log(f'有効行: {len(df_valid)} 行 / 除外行（結果統合≠1）: {len(df_excluded)} 行')
+    log(f'有効行: {len(df_valid)} 行 / 除外行（結果統合≦0またはNaN）: {len(df_excluded)} 行')
     if len(df_excluded) > 0:
         excl_dist = df_excluded[col_filter].value_counts(dropna=False)
         log(f'  除外内訳: {excl_dist.to_dict()}')
@@ -158,11 +162,11 @@ def process(input_path: str, output_path: str, log=print) -> None:
         if key not in records:
             records[key] = {
                 'name_counter': Counter(),
-                'dates_valid':  [],
+                'entries':      [],   # (参加日, 活動時間) のリスト
             }
         records[key]['name_counter'][row[col_name]] += 1
         if pd.notna(row[col_date]):
-            records[key]['dates_valid'].append(row[col_date])
+            records[key]['entries'].append((row[col_date], row[col_filter]))
 
     log(f'{len(records)} 件（学生×プログラム）のデータを処理中...')
 
@@ -179,20 +183,19 @@ def process(input_path: str, output_path: str, log=print) -> None:
         reg_date = reg_lookup.get((sid, jcpp), None)
         email    = email_lookup.get((sid, jcpp), '')
 
-        # 登録日より前の参加日を除外
-        all_dates = sorted(data['dates_valid'])
+        # 登録日より前の参加日を除外（(参加日, 活動時間) のペアを日付昇順で処理）
+        all_entries = sorted(data['entries'], key=lambda x: x[0])
         if reg_date and pd.notna(reg_date):
-            filtered_dates = [d for d in all_dates if d >= reg_date]
-            before_reg_removed += len(all_dates) - len(filtered_dates)
+            filtered = [(d, t) for (d, t) in all_entries if d >= reg_date]
+            before_reg_removed += len(all_entries) - len(filtered)
         else:
-            filtered_dates = all_dates
+            filtered = all_entries
 
-        before_dedup = len(filtered_dates)
-        sorted_dates = filtered_dates
-        after_dedup  = len(sorted_dates)
-        total_before_dedup += before_dedup
-        total_after_dedup  += after_dedup
-        badge = determine_badge(after_dedup, jcpp)
+        count_entries = len(filtered)                 # 参加行数（件数チェック用）
+        total_hours   = sum(t for _, t in filtered)   # 合計活動時間（N列の合計）
+        total_before_dedup += count_entries
+        total_after_dedup  += count_entries
+        badge = determine_badge(total_hours, jcpp)
 
         row_data: dict = {
             'No':                   '',
@@ -203,10 +206,14 @@ def process(input_path: str, output_path: str, log=print) -> None:
             'メールアドレス':       email,
             'オープンバッジ登録日': reg_date if (reg_date is not None and pd.notna(reg_date)) else '',
             '取得badge':            badge,
-            '活動日':               after_dedup,
+            '合計活動時間':         total_hours,
         }
-        for j, d in enumerate(sorted_dates, start=1):
+        half_js = set()                       # 0.5時間の参加日（着色用、出力はしない）
+        for j, (d, t) in enumerate(filtered, start=1):
             row_data[f'参加日{j}'] = d.strftime('%Y-%m-%d')
+            if t == 0.5:
+                half_js.add(j)
+        row_data['_half_js'] = half_js
         rows.append(row_data)
 
     # ---- 件数差異のサマリー ----
@@ -229,9 +236,21 @@ def process(input_path: str, output_path: str, log=print) -> None:
         r['No'] = i
 
     # ---- 除外データシート ----
-    excl_cols   = [col_sid, col_name, col_date, col_filter]
-    excl_rename = {col_sid: '学生番号', col_name: '氏名',
-                   col_date: '参加日', col_filter: '結果統合値'}
+    # 追加カラムを生成（No・プログラム名・メールアドレス）
+    df_excluded = df_excluded.copy()
+    col_program = col_status                 # badge_status = プログラム名
+    col_address = 'メールアドレス'            # participation側に列が無いのでlookupで補完
+    col_num     = 'No'
+
+    df_excluded[col_address] = [
+        email_lookup.get((_norm_sid(s), _norm(p)), '')
+        for s, p in zip(df_excluded[col_sid], df_excluded[col_program])
+    ]
+    df_excluded[col_num] = range(1, len(df_excluded) + 1)
+
+    excl_cols   = [col_num, col_program, col_sid, col_name, col_address, col_date, col_filter]
+    excl_rename = {col_num: 'No', col_program:'プログラム名', col_sid: '学生番号', col_name: '氏名', col_address: 'メールアドレス',
+                    col_date: '参加日', col_filter: '結果統合値'}
     if col_exclude:
         excl_cols.append(col_exclude)
         excl_rename[col_exclude] = '除外理由'
@@ -241,6 +260,9 @@ def process(input_path: str, output_path: str, log=print) -> None:
         .rename(columns=excl_rename)
         .reset_index(drop=True)
     )
+
+    # 着色用の0.5位置を取り出してから出力データを作成（活動時間列は出力しない）
+    half_js_per_row = [r.pop('_half_js', set()) for r in rows]
 
     # ---- Excel出力 ----
     with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
@@ -256,6 +278,15 @@ def process(input_path: str, output_path: str, log=print) -> None:
             fill  = BADGE_FILLS.get(cell.value)
             if fill:
                 cell.fill = fill
+
+        # 0.5時間の参加日セルを薄いskyblueで塗る
+        date_col_idx = {
+            int(c[3:]): out_df.columns.get_loc(c) + 1
+            for c in out_df.columns if c.startswith('参加日')
+        }
+        for i, half_js in enumerate(half_js_per_row):
+            for j in half_js:
+                ws.cell(row=i + 2, column=date_col_idx[j]).fill = HALF_FILL
 
     log(f'完了！ {len(rows)} 人 → {output_path}')
     log(f'  ※「除外データ」シートに {len(df_excl_out)} 行の未適用データを記録しました')
