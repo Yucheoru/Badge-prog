@@ -200,12 +200,17 @@ def process(input_path: str, output_path: str, log=print) -> None:
         row_data: dict = {
             'No':                   '',
             'プログラム名':         jcpp,
+            '学部':                  '',
             '学生番号':             sid,
-            '氏名':                 name,
+            '学生氏名（学生申請）':           name,
+            'メールアドレス（学生申請）':       email,
+            'メールアドレス（岡大公式）':       '',
+            '年次':                       '',
             '国籍':                 '',
-            'メールアドレス':       email,
+            '備考':                    '',
+            '言語':                     '',
+            '取得バッジ':            badge,
             'オープンバッジ登録日': reg_date if (reg_date is not None and pd.notna(reg_date)) else '',
-            '取得badge':            badge,
             '合計活動時間':         total_hours,
         }
         half_js = set()                       # 0.5時間の参加日（着色用、出力はしない）
@@ -272,7 +277,7 @@ def process(input_path: str, output_path: str, log=print) -> None:
 
         # バッジ列に色を付ける
         ws = writer.sheets['結果']
-        badge_col_idx = out_df.columns.get_loc('取得badge') + 1  # 1始まり
+        badge_col_idx = out_df.columns.get_loc('取得バッジ') + 1  # 1始まり
         for row_idx in range(2, len(rows) + 2):          # 2行目～（1行目はヘッダー）
             cell  = ws.cell(row=row_idx, column=badge_col_idx)
             fill  = BADGE_FILLS.get(cell.value)
