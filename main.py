@@ -203,6 +203,8 @@ def process(input_path: str, output_path: str, log=print) -> None:
             '学部':                  '',
             '学生番号':             sid,
             '学生氏名（学生申請）':           name,
+            '学生氏名（英文）':        '',
+            '学生氏名':                 '',
             'メールアドレス（学生申請）':       email,
             'メールアドレス（岡大公式）':       '',
             '年次':                       '',
