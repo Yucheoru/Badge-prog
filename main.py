@@ -78,6 +78,7 @@ def process(input_path: str, output_path: str, log=print) -> None:
     # キー: (氏名, プログラム名)  登録日はタイムスタンプの最古値
     reg_lookup:   dict = {}   # (学生番号, prog) -> オープンバッジ登録日
     email_lookup: dict = {}   # (学生番号, prog) -> email
+    grad_keys:    set  = set()   # 卒業/Gold=1 の (学生番号, prog)
 
     reg_sheet = 'OpenBadge_all_clean'
     if reg_sheet in xl.sheet_names:
@@ -86,6 +87,7 @@ def process(input_path: str, output_path: str, log=print) -> None:
         r_prog  = _find_col(df_reg, 'プログラム')
         r_date  = _find_col(df_reg, 'オープンバッジ登録日') or _find_col(df_reg, '登録日')
         r_email = _find_col(df_reg, 'email') or _find_col(df_reg, 'メール')
+        r_grad  = _find_col(df_reg, '卒業') or _find_col(df_reg, 'gold')
 
         if r_sid and r_prog and r_date:
             df_reg[r_date] = pd.to_datetime(df_reg[r_date], errors='coerce')
@@ -100,7 +102,14 @@ def process(input_path: str, output_path: str, log=print) -> None:
                 # メールアドレス
                 if r_email and pd.notna(row.get(r_email)) and key not in email_lookup:
                     email_lookup[key] = row[r_email]
+                # 卒業/Gold フラグ（1 のみ対象）
+                if r_grad and pd.to_numeric(row.get(r_grad), errors='coerce') == 1:
+                    grad_keys.add(key)
             log(f'OpenBadge_all_clean: {len(reg_lookup)} 件の登録日を取得（学生番号＋プログラム名で照合）')
+            if r_grad:
+                log(f'  卒業/Gold=1: {len(grad_keys)} 件（別シートに分離）')
+            else:
+                log(f'  ※ 卒業/Gold 列が見つかりません（分離なし）')
         else:
             log(f'警告: OpenBadge_all_cleanシートのカラムを特定できませんでした（列: {list(df_reg.columns)}）')
     else:
@@ -171,6 +180,7 @@ def process(input_path: str, output_path: str, log=print) -> None:
     log(f'{len(records)} 件（学生×プログラム）のデータを処理中...')
 
     rows = []
+    grad_rows = []          # 卒業/Gold=1 の行（別シート出力、結果シートには含めない）
     total_before_dedup = 0
     total_after_dedup  = 0
 
@@ -221,7 +231,10 @@ def process(input_path: str, output_path: str, log=print) -> None:
             if t == 0.5:
                 half_js.add(j)
         row_data['_half_js'] = half_js
-        rows.append(row_data)
+        if (sid, jcpp) in grad_keys:
+            grad_rows.append(row_data)
+        else:
+            rows.append(row_data)
 
     # ---- 件数差異のサマリー ----
     dedup_removed = total_before_dedup - total_after_dedup
@@ -238,9 +251,10 @@ def process(input_path: str, output_path: str, log=print) -> None:
     log('─' * 40)
 
     # ---- プログラム名順にソートしてNo採番 ----
-    rows.sort(key=lambda r: str(r['プログラム名']))
-    for i, r in enumerate(rows, start=1):
-        r['No'] = i
+    for group in (rows, grad_rows):
+        group.sort(key=lambda r: str(r['プログラム名']))
+        for i, r in enumerate(group, start=1):
+            r['No'] = i
 
     # ---- 除外データシート ----
     # 追加カラムを生成（No・プログラム名・メールアドレス）
@@ -269,20 +283,22 @@ def process(input_path: str, output_path: str, log=print) -> None:
     )
 
     # 着色用の0.5位置を取り出してから出力データを作成（活動時間列は出力しない）
-    half_js_per_row = [r.pop('_half_js', set()) for r in rows]
+    half_js_per_row      = [r.pop('_half_js', set()) for r in rows]
+    grad_half_js_per_row = [r.pop('_half_js', set()) for r in grad_rows]
 
-    # ---- Excel出力 ----
-    with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
-        out_df = pd.DataFrame(rows)
-        out_df.to_excel(writer, sheet_name='結果', index=False)
-        df_excl_out.to_excel(writer, sheet_name='除外データ', index=False)
+    def _write_result_sheet(writer, sheet_rows, half_per_row, sheet_name):
+        """結果シートと同じフォーマット・着色で書き出す"""
+        out_df = pd.DataFrame(sheet_rows)
+        out_df.to_excel(writer, sheet_name=sheet_name, index=False)
+        if out_df.empty:
+            return
+        ws = writer.sheets[sheet_name]
 
         # バッジ列に色を付ける
-        ws = writer.sheets['結果']
         badge_col_idx = out_df.columns.get_loc('取得バッジ') + 1  # 1始まり
-        for row_idx in range(2, len(rows) + 2):          # 2行目～（1行目はヘッダー）
-            cell  = ws.cell(row=row_idx, column=badge_col_idx)
-            fill  = BADGE_FILLS.get(cell.value)
+        for row_idx in range(2, len(sheet_rows) + 2):    # 2行目～（1行目はヘッダー）
+            cell = ws.cell(row=row_idx, column=badge_col_idx)
+            fill = BADGE_FILLS.get(cell.value)
             if fill:
                 cell.fill = fill
 
@@ -291,11 +307,17 @@ def process(input_path: str, output_path: str, log=print) -> None:
             int(c[3:]): out_df.columns.get_loc(c) + 1
             for c in out_df.columns if c.startswith('参加日')
         }
-        for i, half_js in enumerate(half_js_per_row):
+        for i, half_js in enumerate(half_per_row):
             for j in half_js:
                 ws.cell(row=i + 2, column=date_col_idx[j]).fill = HALF_FILL
 
-    log(f'完了！ {len(rows)} 人 → {output_path}')
+    # ---- Excel出力 ----
+    with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+        _write_result_sheet(writer, rows, half_js_per_row, '結果')
+        _write_result_sheet(writer, grad_rows, grad_half_js_per_row, '卒業_Gold')
+        df_excl_out.to_excel(writer, sheet_name='除外データ', index=False)
+
+    log(f'完了！ 結果 {len(rows)} 人 / 卒業_Gold {len(grad_rows)} 人 → {output_path}')
     log(f'  ※「除外データ」シートに {len(df_excl_out)} 行の未適用データを記録しました')
 
 
