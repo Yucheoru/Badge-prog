@@ -1,0 +1,16 @@
+# 名簿には個人情報が含まれるため、Excel/CSV はコミットしない
+*.xlsx
+*.xls
+*.csv
+
+__pycache__/
+.pytest_cache/
+build/
+dist/
+*.spec
+
+# ローカル専用
+.DS_Store
+CLAUDE.md
+anonymize.py
+make_dummy.py

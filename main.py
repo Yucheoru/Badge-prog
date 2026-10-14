@@ -1,324 +1,259 @@
+"""L-café オープンバッジの授与対象者を判定するツール。
+
+参加記録の名簿から学生×プログラムごとの活動時間を集計し、
+Gold / Silver / Bronze の対象者を Excel に出力する。
+"""
+import re
 import sys
-import pandas as pd
 from collections import Counter
+
+import pandas as pd
 from openpyxl.styles import PatternFill
 
+PARTICIPATION_SHEET = 'participation_ALL_clean'
+REGISTRATION_SHEET = 'OpenBadge_all_clean'
 
-# キーワード部分一致でバッジ基準を決定（L-caféプレフィックス等に対応）
-# 上から順に最初に一致したルールを使用
-BADGE_CRITERIA_RULES: list[tuple[list[str], dict]] = [
-    (['jcpp', 'learner'],  {'Bronze': 10, 'Silver': 20, 'Gold': 30}),
-    (['jcpp', 'provider'], {'Bronze': 15, 'Silver': 30, 'Gold': 45}),
+# プログラム名にキーワードがすべて含まれる最初のルールを使う。
+# 名簿のプログラム名には "L-café" などの接頭辞が付くため部分一致にしている。
+BADGE_CRITERIA_RULES = [
+    (['jcpp', 'learner'], {'Gold': 30, 'Silver': 20, 'Bronze': 10}),
+    (['jcpp', 'provider'], {'Gold': 45, 'Silver': 30, 'Bronze': 15}),
 ]
+DEFAULT_CRITERIA = {'Gold': 45, 'Silver': 30, 'Bronze': 15}
 
-DEFAULT_CRITERIA = {'Bronze': 15, 'Silver': 30, 'Gold': 45}
-
-# バッジセル背景色（ARGB形式）
 BADGE_FILLS = {
-    'Gold':   PatternFill(fill_type='solid', fgColor='FFD700'),
+    'Gold': PatternFill(fill_type='solid', fgColor='FFD700'),
     'Silver': PatternFill(fill_type='solid', fgColor='C0C0C0'),
     'Bronze': PatternFill(fill_type='solid', fgColor='CD7F32'),
 }
-
-# 0.5時間（半分参加）の参加日セルを薄いskyblueで塗る
-HALF_FILL = PatternFill(fill_type='solid', fgColor='CCE5FF')
+HALF_HOUR_FILL = PatternFill(fill_type='solid', fgColor='CCE5FF')
 
 
-def _norm(s: str) -> str:
-    """スペース・全角スペースを正規化して比較用文字列を返す"""
-    import re
-    s = re.sub(r'[\s　]+', ' ', str(s)).strip()
-    s = re.sub(r'\s+（', '（', s)   # （の直前のスペースを除去
-    s = re.sub(r'）\s+', '）', s)   # ）の直後のスペースを除去
+def normalize_text(value) -> str:
+    """表記ゆれを吸収するため、空白（全角含む）と括弧まわりのスペースを揃える。"""
+    s = re.sub(r'[\s　]+', ' ', str(value)).strip()
+    s = re.sub(r'\s+（', '（', s)
+    s = re.sub(r'）\s+', '）', s)
     return s
 
 
-def _norm_sid(s: str) -> str:
-    """学生番号を正規化（大文字小文字を統一）"""
-    return _norm(s).upper()
+def normalize_sid(value) -> str:
+    """学生番号は大文字・小文字が混在するので大文字に揃える。"""
+    return normalize_text(value).upper()
 
 
-def _find_col(df: pd.DataFrame, *keywords: str) -> str | None:
-    kws = [k.lower() for k in keywords]
+def find_column(df: pd.DataFrame, *keywords: str):
+    """列名にキーワードがすべて含まれる最初の列を返す。なければ None。"""
+    keywords = [k.lower() for k in keywords]
     for col in df.columns:
-        c = col.lower()
-        if all(k in c for k in kws):
+        if all(k in col.lower() for k in keywords):
             return col
     return None
 
 
-def determine_badge(count: float, jcpp_type: str) -> str:
-    jcpp_lower = str(jcpp_type).lower()
+def determine_badge(hours: float, program: str) -> str:
+    program = str(program).lower()
     criteria = DEFAULT_CRITERIA
-    for keywords, crit in BADGE_CRITERIA_RULES:
-        if all(k in jcpp_lower for k in keywords):
-            criteria = crit
+    for keywords, rule in BADGE_CRITERIA_RULES:
+        if all(k in program for k in keywords):
+            criteria = rule
             break
-    if count >= criteria['Gold']:   return 'Gold'
-    if count >= criteria['Silver']: return 'Silver'
-    if count >= criteria['Bronze']: return 'Bronze'
+    for badge in ('Gold', 'Silver', 'Bronze'):
+        if hours >= criteria[badge]:
+            return badge
     return ''
+
+
+def load_registrations(xl: pd.ExcelFile, log):
+    """バッジ登録シートから (学生番号, プログラム名) ごとの登録日・メール・卒業フラグを読む。
+
+    同じ学生が複数回登録している場合は最も古い登録日を使う。
+    """
+    reg_dates, emails, graduated = {}, {}, set()
+
+    if REGISTRATION_SHEET not in xl.sheet_names:
+        log(f'警告: {REGISTRATION_SHEET} シートがないため、登録日とメールは空欄になります。')
+        log(f'シート一覧: {xl.sheet_names}')
+        return reg_dates, emails, graduated
+
+    df = xl.parse(REGISTRATION_SHEET)
+    col_sid = find_column(df, '学生番号') or find_column(df, 'student')
+    col_prog = find_column(df, 'プログラム')
+    col_date = find_column(df, 'オープンバッジ登録日') or find_column(df, '登録日')
+    col_email = find_column(df, 'email') or find_column(df, 'メール')
+    col_grad = find_column(df, '卒業') or find_column(df, 'gold')
+
+    if not (col_sid and col_prog and col_date):
+        log(f'警告: {REGISTRATION_SHEET} の必要な列が見つかりません。列: {list(df.columns)}')
+        return reg_dates, emails, graduated
+
+    df[col_date] = pd.to_datetime(df[col_date], errors='coerce')
+    for _, row in df.iterrows():
+        key = (normalize_sid(row[col_sid]), normalize_text(row[col_prog]))
+        date = row[col_date]
+        if pd.notna(date) and (key not in reg_dates or date < reg_dates[key]):
+            reg_dates[key] = date
+        if col_email and pd.notna(row.get(col_email)) and key not in emails:
+            emails[key] = row[col_email]
+        if col_grad and pd.to_numeric(row.get(col_grad), errors='coerce') == 1:
+            graduated.add(key)
+
+    log(f'登録日を {len(reg_dates)} 件取得しました（学生番号とプログラム名で照合）。')
+    if col_grad:
+        log(f'卒業/Gold の {len(graduated)} 件は別シートに出力します。')
+    else:
+        log('卒業/Gold 列がないため、別シートへの分離は行いません。')
+    return reg_dates, emails, graduated
+
+
+def write_result_sheet(writer, rows: list, sheet_name: str) -> None:
+    """結果を書き出し、バッジ列と 0.5 時間の参加日セルに色を付ける。"""
+    half_hour_days = [row.pop('_half_hour_days') for row in rows]
+    df = pd.DataFrame(rows)
+    df.to_excel(writer, sheet_name=sheet_name, index=False)
+    if df.empty:
+        return
+
+    ws = writer.sheets[sheet_name]
+    badge_col = df.columns.get_loc('取得バッジ') + 1
+    for r in range(2, len(rows) + 2):
+        cell = ws.cell(row=r, column=badge_col)
+        if cell.value in BADGE_FILLS:
+            cell.fill = BADGE_FILLS[cell.value]
+
+    date_cols = {int(c[3:]): df.columns.get_loc(c) + 1 for c in df.columns if c.startswith('参加日')}
+    for i, days in enumerate(half_hour_days):
+        for j in days:
+            ws.cell(row=i + 2, column=date_cols[j]).fill = HALF_HOUR_FILL
 
 
 def process(input_path: str, output_path: str, log=print) -> None:
     log('読み込み中...')
     xl = pd.ExcelFile(input_path)
-
-    # ---- participation_ALL_clean シート読み込み ----
-    target_sheets = ['participation_ALL_clean']
-    available = [s for s in target_sheets if s in xl.sheet_names]
-    if not available:
-        raise ValueError(f'participation_ALL_cleanシートが見つかりません。シート一覧: {xl.sheet_names}')
-    log(f'読み込みシート: {available}')
-    df = pd.concat([xl.parse(s, header=0) for s in available], ignore_index=True)
+    if PARTICIPATION_SHEET not in xl.sheet_names:
+        raise ValueError(f'{PARTICIPATION_SHEET} シートが見つかりません。シート一覧: {xl.sheet_names}')
+    df = xl.parse(PARTICIPATION_SHEET)
     total_input = len(df)
-    log(f'入力データ合計: {total_input} 行')
+    log(f'参加記録: {total_input} 行')
 
-    # ---- OpenBadge_all_clean から登録日・メールを取得 ----
-    # キー: (氏名, プログラム名)  登録日はタイムスタンプの最古値
-    reg_lookup:   dict = {}   # (学生番号, prog) -> オープンバッジ登録日
-    email_lookup: dict = {}   # (学生番号, prog) -> email
-    grad_keys:    set  = set()   # 卒業/Gold=1 の (学生番号, prog)
+    reg_dates, emails, graduated = load_registrations(xl, log)
 
-    reg_sheet = 'OpenBadge_all_clean'
-    if reg_sheet in xl.sheet_names:
-        df_reg  = xl.parse(reg_sheet, header=0)
-        r_sid   = _find_col(df_reg, '学生番号') or _find_col(df_reg, 'student')
-        r_prog  = _find_col(df_reg, 'プログラム')
-        r_date  = _find_col(df_reg, 'オープンバッジ登録日') or _find_col(df_reg, '登録日')
-        r_email = _find_col(df_reg, 'email') or _find_col(df_reg, 'メール')
-        r_grad  = _find_col(df_reg, '卒業') or _find_col(df_reg, 'gold')
+    col_sid = find_column(df, '学生番号') or find_column(df, '学籍番号')
+    col_name = find_column(df, '氏名') or find_column(df, 'name')
+    col_date = find_column(df, '参加日')
+    col_hours = find_column(df, '1のみ') or find_column(df, '結果統合', '計算')
+    col_program = find_column(df, 'badge_status') or find_column(df, 'badge', 'status')
+    col_reason = find_column(df, 'exclude_reason') or find_column(df, '除外')
 
-        if r_sid and r_prog and r_date:
-            df_reg[r_date] = pd.to_datetime(df_reg[r_date], errors='coerce')
-            for _, row in df_reg.iterrows():
-                sid  = _norm_sid(row[r_sid])
-                prog = _norm(row[r_prog])
-                date = row[r_date]
-                key  = (sid, prog)
-                # 最古の登録日を使用
-                if pd.notna(date) and (key not in reg_lookup or date < reg_lookup[key]):
-                    reg_lookup[key] = date
-                # メールアドレス
-                if r_email and pd.notna(row.get(r_email)) and key not in email_lookup:
-                    email_lookup[key] = row[r_email]
-                # 卒業/Gold フラグ（1 のみ対象）
-                if r_grad and pd.to_numeric(row.get(r_grad), errors='coerce') == 1:
-                    grad_keys.add(key)
-            log(f'OpenBadge_all_clean: {len(reg_lookup)} 件の登録日を取得（学生番号＋プログラム名で照合）')
-            if r_grad:
-                log(f'  卒業/Gold=1: {len(grad_keys)} 件（別シートに分離）')
-            else:
-                log(f'  ※ 卒業/Gold 列が見つかりません（分離なし）')
-        else:
-            log(f'警告: OpenBadge_all_cleanシートのカラムを特定できませんでした（列: {list(df_reg.columns)}）')
-    else:
-        log(f'警告: {reg_sheet} シートが見つかりません。登録日・メールは空欄になります。')
-        log(f'  利用可能シート: {xl.sheet_names}')
-
-    # ---- カラム検出 ----
-    col_sid    = _find_col(df, '学生番号') or _find_col(df, '学籍番号')
-    col_name   = _find_col(df, '氏名') or _find_col(df, 'name')
-    col_date   = _find_col(df, '参加日')
-    col_filter = _find_col(df, '1のみ') or _find_col(df, '結果統合', '計算')
-    col_status = _find_col(df, 'badge_status') or _find_col(df, 'badge', 'status')
-    col_exclude = _find_col(df, 'exclude_reason') or _find_col(df, '除外')
-
-    missing = [n for n, c in [
+    missing = [label for label, col in [
         ('学生番号', col_sid), ('氏名', col_name), ('参加日', col_date),
-        ('結果統合フィルター', col_filter), ('badge_status', col_status),
-    ] if c is None]
+        ('結果統合', col_hours), ('badge_status', col_program),
+    ] if col is None]
     if missing:
-        raise ValueError(f'以下のカラムが見つかりません: {missing}\n列名一覧: {list(df.columns)}')
+        raise ValueError(f'必要な列が見つかりません: {missing}\n列一覧: {list(df.columns)}')
 
-    # ---- 結果統合列の値の分布を表示 ----
-    filter_dist = df[col_filter].value_counts(dropna=False)
-    log(f'結果統合列の値の分布: {filter_dist.to_dict()}')
+    # 結果統合列は 1（参加）/ 0.5（半分参加）/ 0 または空欄（対象外）
+    log(f'結果統合列の値: {df[col_hours].value_counts(dropna=False).to_dict()}')
+    df[col_hours] = pd.to_numeric(df[col_hours], errors='coerce')
+    valid_mask = df[col_hours] > 0
+    df_excluded = df[~valid_mask].copy()
+    df_valid = df[valid_mask].copy()
+    log(f'集計対象: {len(df_valid)} 行 / 対象外（0 以下・空欄）: {len(df_excluded)} 行')
 
-    # ---- フィルター（結果統合 > 0、すなわち 0.5 と 1 を有効化） ----
-    df[col_filter] = pd.to_numeric(df[col_filter], errors='coerce')
-    mask_valid  = df[col_filter] > 0
-    df_excluded = df[~mask_valid].copy()
-    df_valid    = df[mask_valid].copy()
+    blank_sid = df_valid[col_sid].isna() | df_valid[col_sid].astype(str).str.strip().isin(['', 'nan', 'None'])
+    if blank_sid.any():
+        log(f'注意: 学生番号が空欄の行が {blank_sid.sum()} 行あります（1 人分としてまとめて集計されます）。')
 
-    log(f'有効行: {len(df_valid)} 行 / 除外行（結果統合≦0またはNaN）: {len(df_excluded)} 行')
-    if len(df_excluded) > 0:
-        excl_dist = df_excluded[col_filter].value_counts(dropna=False)
-        log(f'  除外内訳: {excl_dist.to_dict()}')
+    df_valid[col_sid] = df_valid[col_sid].astype(str).str.strip()
+    df_valid[col_date] = pd.to_datetime(df_valid[col_date], errors='coerce', format='mixed')
+    unreadable_dates = int(df_valid[col_date].isna().sum())
+    if unreadable_dates:
+        log(f'注意: 参加日を読み取れない行が {unreadable_dates} 行あり、集計から外しました。')
 
-    df_valid = df_valid.copy()
-    df_valid[col_sid]  = df_valid[col_sid].astype(str).str.strip()
-    df_valid[col_date] = pd.to_datetime(df_valid[col_date], errors='coerce')
-
-    # NaN日付の件数を把握
-    nan_date_count = df_valid[col_date].isna().sum()
-    log(f'  参加日NaN（日付パース失敗）: {nan_date_count} 行')
-
-    # 学生番号の異常値チェック
-    abnormal_sid = df_valid[df_valid[col_sid].isin(['', 'nan', 'NaN', 'None', 'na', 'NA'])]
-    if len(abnormal_sid) > 0:
-        log(f'  ⚠ 学生番号が空/nan の行: {len(abnormal_sid)} 行 → これらは1つのグループにまとめられます')
-
-    # 全体の行数チェック（フィルター前）
-    log(f'  シート全行: {total_input} = 有効{len(df_valid)} + 除外{len(df_excluded)} → 合計{len(df_valid)+len(df_excluded)} {"✓" if len(df_valid)+len(df_excluded)==total_input else "← 不一致！"}')
-
-    # ---- 学生×プログラム名ごとに集計 ----
-    records: dict = {}
+    # 学生番号とプログラム名の組み合わせごとに参加記録をまとめる
+    records = {}
     for _, row in df_valid.iterrows():
-        sid  = _norm_sid(row[col_sid])
-        prog = _norm(row[col_status])
-        key  = (sid, prog)                   # ← (学生番号, プログラム名) で一意に管理
-        if key not in records:
-            records[key] = {
-                'name_counter': Counter(),
-                'entries':      [],   # (参加日, 活動時間) のリスト
-            }
-        records[key]['name_counter'][row[col_name]] += 1
+        key = (normalize_sid(row[col_sid]), normalize_text(row[col_program]))
+        rec = records.setdefault(key, {'names': Counter(), 'entries': []})
+        rec['names'][row[col_name]] += 1
         if pd.notna(row[col_date]):
-            records[key]['entries'].append((row[col_date], row[col_filter]))
+            rec['entries'].append((row[col_date], row[col_hours]))
+    log(f'{len(records)} 件（学生×プログラム）を判定します。')
 
-    log(f'{len(records)} 件（学生×プログラム）のデータを処理中...')
+    rows, graduated_rows = [], []
+    removed_before_reg = 0
+    counted_days = 0
+    for (sid, program), rec in records.items():
+        reg_date = reg_dates.get((sid, program))
+        entries = sorted(rec['entries'], key=lambda e: e[0])
+        if reg_date is not None:
+            # バッジ登録日より前の参加は数えない
+            kept = [(d, h) for d, h in entries if d >= reg_date]
+            removed_before_reg += len(entries) - len(kept)
+            entries = kept
+        counted_days += len(entries)
+        total_hours = sum(h for _, h in entries)
 
-    rows = []
-    grad_rows = []          # 卒業/Gold=1 の行（別シート出力、結果シートには含めない）
-    total_before_dedup = 0
-    total_after_dedup  = 0
-
-    before_reg_removed = 0
-
-    for (sid, jcpp), data in records.items():
-        name = data['name_counter'].most_common(1)[0][0]
-
-        # 登録日・メールを取得（学生番号＋プログラム名で照合）
-        reg_date = reg_lookup.get((sid, jcpp), None)
-        email    = email_lookup.get((sid, jcpp), '')
-
-        # 登録日より前の参加日を除外（(参加日, 活動時間) のペアを日付昇順で処理）
-        all_entries = sorted(data['entries'], key=lambda x: x[0])
-        if reg_date and pd.notna(reg_date):
-            filtered = [(d, t) for (d, t) in all_entries if d >= reg_date]
-            before_reg_removed += len(all_entries) - len(filtered)
-        else:
-            filtered = all_entries
-
-        count_entries = len(filtered)                 # 参加行数（件数チェック用）
-        total_hours   = sum(t for _, t in filtered)   # 合計活動時間（N列の合計）
-        total_before_dedup += count_entries
-        total_after_dedup  += count_entries
-        badge = determine_badge(total_hours, jcpp)
-
-        row_data: dict = {
-            'No':                   '',
-            'プログラム名':         jcpp,
-            '学部':                  '',
-            '学生番号':             sid,
-            '学生氏名（学生申請）':           name,
-            '学生氏名（英文）':        '',
-            '学生氏名':                 '',
-            'メールアドレス（学生申請）':       email,
-            'メールアドレス（岡大公式）':       '',
-            '年次':                       '',
-            '国籍':                 '',
-            '備考':                    '',
-            '言語':                     '',
-            '取得バッジ':            badge,
-            'オープンバッジ登録日': reg_date if (reg_date is not None and pd.notna(reg_date)) else '',
-            '合計活動時間':         total_hours,
+        row = {
+            'No': '',
+            'プログラム名': program,
+            '学部': '',
+            '学生番号': sid,
+            '学生氏名（学生申請）': rec['names'].most_common(1)[0][0],
+            '学生氏名（英文）': '',
+            '学生氏名': '',
+            'メールアドレス（学生申請）': emails.get((sid, program), ''),
+            'メールアドレス（岡大公式）': '',
+            '年次': '',
+            '国籍': '',
+            '備考': '',
+            '言語': '',
+            '取得バッジ': determine_badge(total_hours, program),
+            'オープンバッジ登録日': reg_date if reg_date is not None else '',
+            '合計活動時間': total_hours,
         }
-        half_js = set()                       # 0.5時間の参加日（着色用、出力はしない）
-        for j, (d, t) in enumerate(filtered, start=1):
-            row_data[f'参加日{j}'] = d.strftime('%Y-%m-%d')
-            if t == 0.5:
-                half_js.add(j)
-        row_data['_half_js'] = half_js
-        if (sid, jcpp) in grad_keys:
-            grad_rows.append(row_data)
-        else:
-            rows.append(row_data)
+        for j, (d, _) in enumerate(entries, start=1):
+            row[f'参加日{j}'] = d.strftime('%Y-%m-%d')
+        row['_half_hour_days'] = {j for j, (_, h) in enumerate(entries, start=1) if h == 0.5}
 
-    # ---- 件数差異のサマリー ----
-    dedup_removed = total_before_dedup - total_after_dedup
-    log('─' * 40)
-    log(f'【件数チェック】')
-    log(f'  入力合計行数          : {total_input}')
-    log(f'  除外（結果統合≠1）   : {len(df_excluded)}')
-    log(f'  有効行（結果統合=1）  : {len(df_valid)}')
-    log(f'  うちNaN日付で除外     : {nan_date_count}')
-    log(f'  登録日より前で除外    : {before_reg_removed}')
-    log(f'  重複日付で除去（同日複数回）: {dedup_removed}')
-    log(f'  活動日合計            : {total_after_dedup}')
-    log(f'  検算（除外+登録前+重複+活動日）: {len(df_excluded) + before_reg_removed + dedup_removed + total_after_dedup} {"✓" if len(df_excluded)+before_reg_removed+dedup_removed+total_after_dedup==total_input else "← 不一致！"}')
-    log('─' * 40)
+        (graduated_rows if (sid, program) in graduated else rows).append(row)
 
-    # ---- プログラム名順にソートしてNo採番 ----
-    for group in (rows, grad_rows):
+    for group in (rows, graduated_rows):
         group.sort(key=lambda r: str(r['プログラム名']))
         for i, r in enumerate(group, start=1):
             r['No'] = i
 
-    # ---- 除外データシート ----
-    # 追加カラムを生成（No・プログラム名・メールアドレス）
-    df_excluded = df_excluded.copy()
-    col_program = col_status                 # badge_status = プログラム名
-    col_address = 'メールアドレス'            # participation側に列が無いのでlookupで補完
-    col_num     = 'No'
-
-    df_excluded[col_address] = [
-        email_lookup.get((_norm_sid(s), _norm(p)), '')
+    # 対象外の行も確認できるように別シートへ残す
+    df_excluded['メールアドレス'] = [
+        emails.get((normalize_sid(s), normalize_text(p)), '')
         for s, p in zip(df_excluded[col_sid], df_excluded[col_program])
     ]
-    df_excluded[col_num] = range(1, len(df_excluded) + 1)
+    df_excluded['No'] = range(1, len(df_excluded) + 1)
+    excluded_cols = {
+        'No': 'No', col_program: 'プログラム名', col_sid: '学生番号', col_name: '氏名',
+        'メールアドレス': 'メールアドレス', col_date: '参加日', col_hours: '結果統合値',
+    }
+    if col_reason:
+        excluded_cols[col_reason] = '除外理由'
+    df_excluded_out = df_excluded[list(excluded_cols)].rename(columns=excluded_cols).reset_index(drop=True)
 
-    excl_cols   = [col_num, col_program, col_sid, col_name, col_address, col_date, col_filter]
-    excl_rename = {col_num: 'No', col_program:'プログラム名', col_sid: '学生番号', col_name: '氏名', col_address: 'メールアドレス',
-                    col_date: '参加日', col_filter: '結果統合値'}
-    if col_exclude:
-        excl_cols.append(col_exclude)
-        excl_rename[col_exclude] = '除外理由'
+    # 入力行がすべてどこかに振り分けられたかを確認する
+    accounted = len(df_excluded) + unreadable_dates + removed_before_reg + counted_days
+    log('[件数チェック]')
+    log(f'入力行数: {total_input}')
+    log(f'  対象外（結果統合が 0 以下・空欄）: {len(df_excluded)}')
+    log(f'  参加日を読み取れず除外: {unreadable_dates}')
+    log(f'  バッジ登録日より前のため除外: {removed_before_reg}')
+    log(f'  集計した参加日数: {counted_days}')
+    log(f'検算: {accounted} / {total_input}（{"OK" if accounted == total_input else "不一致"}）')
 
-    df_excl_out = (
-        df_excluded[excl_cols]
-        .rename(columns=excl_rename)
-        .reset_index(drop=True)
-    )
-
-    # 着色用の0.5位置を取り出してから出力データを作成（活動時間列は出力しない）
-    half_js_per_row      = [r.pop('_half_js', set()) for r in rows]
-    grad_half_js_per_row = [r.pop('_half_js', set()) for r in grad_rows]
-
-    def _write_result_sheet(writer, sheet_rows, half_per_row, sheet_name):
-        """結果シートと同じフォーマット・着色で書き出す"""
-        out_df = pd.DataFrame(sheet_rows)
-        out_df.to_excel(writer, sheet_name=sheet_name, index=False)
-        if out_df.empty:
-            return
-        ws = writer.sheets[sheet_name]
-
-        # バッジ列に色を付ける
-        badge_col_idx = out_df.columns.get_loc('取得バッジ') + 1  # 1始まり
-        for row_idx in range(2, len(sheet_rows) + 2):    # 2行目～（1行目はヘッダー）
-            cell = ws.cell(row=row_idx, column=badge_col_idx)
-            fill = BADGE_FILLS.get(cell.value)
-            if fill:
-                cell.fill = fill
-
-        # 0.5時間の参加日セルを薄いskyblueで塗る
-        date_col_idx = {
-            int(c[3:]): out_df.columns.get_loc(c) + 1
-            for c in out_df.columns if c.startswith('参加日')
-        }
-        for i, half_js in enumerate(half_per_row):
-            for j in half_js:
-                ws.cell(row=i + 2, column=date_col_idx[j]).fill = HALF_FILL
-
-    # ---- Excel出力 ----
     with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
-        _write_result_sheet(writer, rows, half_js_per_row, '結果')
-        _write_result_sheet(writer, grad_rows, grad_half_js_per_row, '卒業_Gold')
-        df_excl_out.to_excel(writer, sheet_name='除外データ', index=False)
+        write_result_sheet(writer, rows, '結果')
+        write_result_sheet(writer, graduated_rows, '卒業_Gold')
+        df_excluded_out.to_excel(writer, sheet_name='除外データ', index=False)
 
-    log(f'完了！ 結果 {len(rows)} 人 / 卒業_Gold {len(grad_rows)} 人 → {output_path}')
-    log(f'  ※「除外データ」シートに {len(df_excl_out)} 行の未適用データを記録しました')
+    log(f'完了: 結果 {len(rows)} 人 / 卒業_Gold {len(graduated_rows)} 人 → {output_path}')
+    log(f'対象外の {len(df_excluded_out)} 行は「除外データ」シートに出力しました。')
 
 
 if __name__ == '__main__':

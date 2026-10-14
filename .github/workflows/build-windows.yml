@@ -17,7 +17,10 @@ jobs:
           python-version: '3.12'
 
       - name: Install dependencies
-        run: pip install pyinstaller pandas openpyxl
+        run: pip install -r requirements.txt pytest pyinstaller
+
+      - name: Run tests
+        run: pytest
 
       - name: Build EXE
         run: pyinstaller --onedir --windowed --name "バッジ処理ツール" main_gui.py
